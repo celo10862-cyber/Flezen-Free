@@ -1,0 +1,172 @@
+name: Build, Sign and Release Flezen Free APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project files
+        run: flutter create --platforms=android --project-name flezen_free --org com.flezenfree .
+
+      - name: Clean previous build outputs
+        run: flutter clean
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Compatibility fix: flutter_inappwebview_android 1.1.3 still refers
+      # to the legacy ProGuard defaults file, which recent Android Gradle
+      # Plugin versions reject. Use the supported optimized defaults file.
+      - name: Patch inappwebview Android Gradle compatibility
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cache = Path.home() / ".pub-cache" / "hosted" / "pub.dev"
+          matches = list(cache.glob(
+              "flutter_inappwebview_android-*/android/build.gradle"
+          ))
+
+          if not matches:
+              raise SystemExit(
+                  "Could not find flutter_inappwebview_android Android build.gradle"
+              )
+
+          for gradle_file in matches:
+              source = gradle_file.read_text()
+              old = "getDefaultProguardFile('proguard-android.txt')"
+              new = "getDefaultProguardFile('proguard-android-optimize.txt')"
+
+              if old in source:
+                  gradle_file.write_text(source.replace(old, new))
+                  print(f"Patched {gradle_file}")
+              elif new in source:
+                  print(f"Already compatible: {gradle_file}")
+              else:
+                  raise SystemExit(
+                      f"Expected ProGuard setting not found in {gradle_file}"
+                  )
+          PY
+
+      - name: Remove generated sample test
+        run: rm -f test/widget_test.dart
+
+      - name: Create temporary release signing key
+        shell: bash
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/flezen-release.jks" \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias flezen \
+            -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'temporary-flezen-password' }}" \
+            -keypass "${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'temporary-flezen-password' }}" \
+            -dname "CN=Flezen Free, OU=Mobile, O=Flezen, L=Kathmandu, S=Bagmati, C=NP"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/flezen-release.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'temporary-flezen-password' }}" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=flezen" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'temporary-flezen-password' }}" >> "$GITHUB_ENV"
+
+      - name: Configure release signing
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gradle = Path("android/app/build.gradle.kts")
+          content = gradle.read_text()
+          content = content.replace(r"\n", "\n")
+
+          signing = """
+              signingConfigs {
+                  create("release") {
+                      storeFile = file(System.getenv("KEYSTORE_PATH"))
+                      storePassword = System.getenv("KEYSTORE_PASSWORD")
+                      keyAlias = System.getenv("KEY_ALIAS")
+                      keyPassword = System.getenv("KEY_PASSWORD")
+                  }
+              }
+          """
+
+          if 'create("release")' not in content:
+              marker = "    buildTypes {"
+              if marker not in content:
+                  raise SystemExit("Could not find buildTypes block in build.gradle.kts")
+              content = content.replace(marker, signing + "\n" + marker, 1)
+
+          content = content.replace(
+              'signingConfig = signingConfigs.getByName("debug")',
+              'signingConfig = signingConfigs.getByName("release")'
+          )
+
+          gradle.write_text(content)
+          PY
+
+      - name: Analyze Flutter project
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Verify APK archive and signature
+        shell: bash
+        run: |
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          unzip -t "$APK"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "Android apksigner was not found"
+            exit 1
+          fi
+          "$APKSIGNER" verify --verbose "$APK"
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version: *\([^+ ]*\).*/\1/p' pubspec.yaml | head -n1)
+          if [ -z "$VERSION" ]; then VERSION="1.0.0"; fi
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            TAG="${TAG}-build.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Flezen Free ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Flezen-Free-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
